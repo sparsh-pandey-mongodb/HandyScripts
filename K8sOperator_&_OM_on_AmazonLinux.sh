@@ -422,3 +422,4 @@ log_step "Ops Manager deployed successfully."
 log_step "Access URL: http://<EC2-PUBLIC-DNS>:8080"
 log_step "Login user: ${OM_ADMIN_USER}"
 log_step "Logs saved to: ${LOG_FILE}"
+#kubectl config set-context $(kubectl config current-context) --namespace=mongodb
