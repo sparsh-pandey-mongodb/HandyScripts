@@ -11,18 +11,40 @@ from datetime import datetime
 from collections import defaultdict
 
 
-def bytes_to_tb(bytes_val):
-    """Convert bytes to TB with 2 decimal places"""
+def bytes_to_human_readable(bytes_val):
+    """Convert bytes to human readable format with appropriate unit"""
     if bytes_val is None or bytes_val == 0:
-        return None
-    return round(bytes_val / (1024 ** 4), 2)
+        return None, None
+
+    units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
+    unit_index = 0
+    value = float(bytes_val)
+
+    while value >= 1024 and unit_index < len(units) - 1:
+        value /= 1024
+        unit_index += 1
+
+    return round(value, 2), units[unit_index]
 
 
-def seconds_to_hours(seconds):
-    """Convert seconds to hours with 1 decimal place"""
+def seconds_to_human_readable(seconds):
+    """Convert seconds to human readable format with appropriate unit"""
     if seconds is None or seconds == 0:
-        return None
-    return round(seconds / 3600, 1)
+        return None, None
+
+    if seconds < 60:
+        value = round(seconds, 1)
+        unit = 'second' if value == 1 else 'seconds'
+        return value, unit
+    elif seconds < 3600:
+        value = round(seconds / 60, 1)
+        unit = 'minute' if value == 1 else 'minutes'
+        return value, unit
+    else:
+        value = round(seconds / 3600, 1)
+        unit = 'hour' if value == 1 else 'hours'
+        return value, unit
+
 
 
 def epoch_to_date(epoch_time):
@@ -61,17 +83,11 @@ def analyze_snapshot(snapshot):
     Analyze a single snapshot entry and extract key metrics.
     Returns None if the snapshot doesn't have detailed metrics.
     """
-    # Skip snapshots without detailed metrics (pre-upgrade entries)
-    if snapshot.get('dataSize', 0) == 0 and snapshot.get('totalDuration') is None:
-        return None
-
     # Skip failed snapshots
     if snapshot.get('state') != 'COMPLETE':
         return None
 
     total_duration = snapshot.get('totalDuration')
-    if total_duration is None or total_duration == 0:
-        return None
 
     # Get start time for date
     start_time = snapshot.get('startTime', {}).get('time')
@@ -88,19 +104,25 @@ def analyze_snapshot(snapshot):
     total_transfer_speed_sum = 0
     transfer_speed_count = 0
     all_complete = True
+    has_metrics = False
     is_incremental = snapshot.get('incrementalBackup', False)
 
     for rs_metadata in snapshots_metadata:
         if rs_metadata.get('state') != 'COMPLETE':
             all_complete = False
             continue
-  
+
+        # Check if this metadata has actual metrics
+        if rs_metadata.get('numNewBytes') or rs_metadata.get('numNewCompressedBytes') or rs_metadata.get('dataBlockUploadDuration') or rs_metadata.get('transferSpeed'):
+            has_metrics = True
+
+        # Only use numNewBytes - don't substitute with other values
         new_bytes = rs_metadata.get('numNewBytes', 0) or rs_metadata.get('numNewCompressedBytes', 0)
         total_new_bytes += new_bytes if new_bytes else 0
-  
+
         data_upload = rs_metadata.get('dataBlockUploadDuration', 0)
         total_data_upload_duration += data_upload if data_upload else 0
-  
+
         speed = rs_metadata.get('transferSpeed')
         if speed and speed > 0:
             total_transfer_speed_sum += speed
@@ -109,20 +131,32 @@ def analyze_snapshot(snapshot):
     if not all_complete:
         return None
 
+    # Skip entries without meaningful metrics
+    if not has_metrics and total_duration is None:
+        return None
+
     # Calculate average transfer speed
     avg_transfer_speed = None
     if transfer_speed_count > 0:
         avg_transfer_speed = total_transfer_speed_sum / transfer_speed_count
 
+    # Convert to human readable formats
+    duration_val, duration_unit = seconds_to_human_readable(total_duration)
+    new_bytes_val, new_bytes_unit = bytes_to_human_readable(total_new_bytes)
+    upload_val, upload_unit = seconds_to_human_readable(total_data_upload_duration)
+
     return {
         'snapshot_id': get_snapshot_id(snapshot),
         'date': epoch_to_date(start_time),
         'epoch_time': start_time,
-        'duration_hours': seconds_to_hours(total_duration),
+        'duration_val': duration_val,
+        'duration_unit': duration_unit,
         'duration_seconds': total_duration,
         'num_new_bytes': total_new_bytes,
-        'num_new_bytes_tb': bytes_to_tb(total_new_bytes),
-        'data_upload_hours': seconds_to_hours(total_data_upload_duration),
+        'num_new_bytes_val': new_bytes_val,
+        'num_new_bytes_unit': new_bytes_unit,
+        'data_upload_val': upload_val,
+        'data_upload_unit': upload_unit,
         'data_upload_seconds': total_data_upload_duration,
         'transfer_speed': format_speed(avg_transfer_speed),
         'is_incremental': is_incremental,
@@ -153,19 +187,33 @@ def generate_cluster_summary(cluster_name, snapshots):
     output.append("")
 
     # Create table header
-    output.append("| Date | Duration | Type | numNewBytes (TB) | Data Upload Time | Transfer Speed | clustershotId |")
-    output.append("|------|----------|------|------------------|------------------|----------------|---------------|")
+    output.append("| Date | Duration | Type | numNewBytes | Data Upload Time | Transfer Speed | clustershotId |")
+    output.append("|------|----------|------|-------------|------------------|----------------|---------------|")
 
     # Add rows
     for entry in analyzed:
         date = entry['date'] or 'N/A'
-        duration = f"{entry['duration_hours']} hours" if entry['duration_hours'] else 'N/A'
+
+        if entry['duration_val'] is not None:
+            duration = f"{entry['duration_val']} {entry['duration_unit']}"
+        else:
+            duration = 'N/A'
+
         backup_type = entry['backup_type']
-        new_bytes = f"{entry['num_new_bytes_tb']} TB" if entry['num_new_bytes_tb'] else 'N/A'
-        upload_time = f"{entry['data_upload_hours']} hours" if entry['data_upload_hours'] else 'N/A'
+
+        if entry['num_new_bytes_val'] is not None:
+            new_bytes = f"{entry['num_new_bytes_val']} {entry['num_new_bytes_unit']}"
+        else:
+            new_bytes = 'N/A'
+
+        if entry['data_upload_val'] is not None:
+            upload_time = f"{entry['data_upload_val']} {entry['data_upload_unit']}"
+        else:
+            upload_time = 'N/A'
+
         speed = f"{entry['transfer_speed']} MB/s" if entry['transfer_speed'] else 'N/A'
         snapshot_id = entry['snapshot_id']
-  
+
         output.append(f"| {date} | {duration} | {backup_type} | {new_bytes} | {upload_time} | {speed} | {snapshot_id} |")
 
     # Add statistics
@@ -177,26 +225,40 @@ def generate_cluster_summary(cluster_name, snapshots):
     output.append("")
 
     if incremental_snapshots:
-        durations = [s['duration_hours'] for s in incremental_snapshots if s['duration_hours']]
-        new_bytes = [s['num_new_bytes_tb'] for s in incremental_snapshots if s['num_new_bytes_tb']]
+        durations = [s['duration_seconds'] for s in incremental_snapshots if s['duration_seconds']]
+        new_bytes = [s['num_new_bytes'] for s in incremental_snapshots if s['num_new_bytes']]
         speeds = [s['transfer_speed'] for s in incremental_snapshots if s['transfer_speed']]
-  
+
+        output.append(f"**Incremental Backups ({len(incremental_snapshots)} snapshots):**")
+
         if durations:
-            output.append(f"**Incremental Backups ({len(incremental_snapshots)} snapshots):**")
-            output.append(f"- Duration: Min {min(durations)} hours, Max {max(durations)} hours, Avg {round(sum(durations)/len(durations), 1)} hours")
+            min_dur_val, min_dur_unit = seconds_to_human_readable(min(durations))
+            max_dur_val, max_dur_unit = seconds_to_human_readable(max(durations))
+            avg_dur_val, avg_dur_unit = seconds_to_human_readable(sum(durations)/len(durations))
+            output.append(f"- Duration: Min {min_dur_val} {min_dur_unit}, Max {max_dur_val} {max_dur_unit}, Avg {avg_dur_val} {avg_dur_unit}")
+
         if new_bytes:
-            output.append(f"- Data transferred: Min {min(new_bytes)} TB, Max {max(new_bytes)} TB, Avg {round(sum(new_bytes)/len(new_bytes), 2)} TB")
+            min_bytes_val, min_bytes_unit = bytes_to_human_readable(min(new_bytes))
+            max_bytes_val, max_bytes_unit = bytes_to_human_readable(max(new_bytes))
+            avg_bytes_val, avg_bytes_unit = bytes_to_human_readable(sum(new_bytes)/len(new_bytes))
+            output.append(f"- Data transferred (numNewBytes): Min {min_bytes_val} {min_bytes_unit}, Max {max_bytes_val} {max_bytes_unit}, Avg {avg_bytes_val} {avg_bytes_unit}")
+
         if speeds:
             output.append(f"- Transfer speed: Min {min(speeds)} MB/s, Max {max(speeds)} MB/s, Avg {round(sum(speeds)/len(speeds), 1)} MB/s")
         output.append("")
 
     if full_snapshots:
-        durations = [s['duration_hours'] for s in full_snapshots if s['duration_hours']]
+        durations = [s['duration_seconds'] for s in full_snapshots if s['duration_seconds']]
         speeds = [s['transfer_speed'] for s in full_snapshots if s['transfer_speed']]
-  
+
+        output.append(f"**Full Backups ({len(full_snapshots)} snapshots):**")
+
         if durations:
-            output.append(f"**Full Backups ({len(full_snapshots)} snapshots):**")
-            output.append(f"- Duration: Min {min(durations)} hours, Max {max(durations)} hours, Avg {round(sum(durations)/len(durations), 1)} hours")
+            min_dur_val, min_dur_unit = seconds_to_human_readable(min(durations))
+            max_dur_val, max_dur_unit = seconds_to_human_readable(max(durations))
+            avg_dur_val, avg_dur_unit = seconds_to_human_readable(sum(durations)/len(durations))
+            output.append(f"- Duration: Min {min_dur_val} {min_dur_unit}, Max {max_dur_val} {max_dur_unit}, Avg {avg_dur_val} {avg_dur_unit}")
+
         if speeds:
             output.append(f"- Transfer speed: Min {min(speeds)} MB/s, Max {max(speeds)} MB/s, Avg {round(sum(speeds)/len(speeds), 1)} MB/s")
         output.append("")
@@ -274,7 +336,7 @@ def main():
     report.append("")
     report.append("- **Duration**: Total time taken for the backup to complete")
     report.append("- **Type**: Incremental (only changed data) or Full (complete backup)")
-    report.append("- **numNewBytes**: Total number of new or modified bytes transferred during the backup. This represents the actual data payload that the backup agent reads from the WiredTiger checkpoint and send to the Ops Manager, which then uploads it to the backup storage. Higher values indicate more data changes since the last snapshot, directly resulting in longer backup times.")
+    report.append("- **numNewBytes**: Total number of new or modified bytes transferred during an incremental backup. This represents the actual data payload that the backup agent reads from the WiredTiger checkpoint and sends to the Ops Manager, which then uploads it to the backup storage. Higher values indicate more data changes since the last snapshot, directly resulting in longer backup times. This field is not applicable (N/A) for Full backups.")
     report.append("- **Data Upload Time**: Time spent uploading data blocks to backup storage")
     report.append("- **Transfer Speed**: Average data transfer rate during the backup")
     report.append("- **clustershotId**: Unique identifier for the snapshot entry. Use this to locate the corresponding document in snapshotHistory.json for validation or detailed analysis.")
@@ -288,9 +350,9 @@ def main():
     report.append("jq '.[] | select(.clustershotId == \"<clustershotId>\")' snapshotHistory.json")
     report.append("```")
     report.append("")
-    report.append("Example:")
+    report.append("For replica set snapshots (without clustershotId), use _id:")
     report.append("```bash")
-    report.append("jq '.[] | select(.clustershotId == \"697b04f84c54f11118e99309\")' snapshotHistory.json")
+    report.append("jq '.[] | select(._id == \"<_id>\")' snapshotHistory.json")
     report.append("```")
 
     # Write report to file
